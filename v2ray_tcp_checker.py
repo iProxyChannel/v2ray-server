@@ -23,6 +23,7 @@ import argparse
 import base64
 import binascii
 import concurrent.futures
+import datetime
 import json
 import logging
 import os
@@ -38,7 +39,16 @@ TCP_TIMEOUT = float(os.environ.get("TCP_TIMEOUT", "3"))        # ثانیه، ت
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "50"))          # تعداد ترد هم‌زمان برای تست
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "10"))    # ثانیه، تایم‌اوت دانلود ساب‌لینک
 OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "fast_servers.txt")
-REMARK_PREFIX = os.environ.get("REMARK_PREFIX", "✅")           # پیشوند ریمارک برای کانفیگ فعال
+REMARK_TEXT = os.environ.get("REMARK_TEXT", "🚀 t.me/iProxyChannel")  # متن ثابت ریمارک برای کانفیگ‌های فعال
+SKIP_TCP_TEST = os.environ.get("SKIP_TCP_TEST", "0") == "1"     # اگه ۱ باشه، تست TCP انجام نمی‌شه
+
+# سرور ثابتی که همیشه ردیف اول فایل خروجی می‌شه (بدون تست TCP، فقط برای نمایش تاریخ آپدیت)
+PINNED_LINK_BASE = os.environ.get("PINNED_LINK_BASE", "socks://Og@0.0.0.0:443")
+PINNED_REMARK_TEMPLATE = os.environ.get(
+    "PINNED_REMARK_TEMPLATE",
+    "🚀 @iProxyChannel                      📆 last update: {date}",
+)
+PINNED_DATE_FORMAT = os.environ.get("PINNED_DATE_FORMAT", "%-d %B %Y")  # تاریخ میلادی، مثل 17 September 2026
 
 logging.basicConfig(
     level=logging.INFO,
@@ -193,21 +203,36 @@ def rebuild_config_with_new_remark(parsed: dict, new_remark: str) -> str:
         return f"{base}#{urllib.parse.quote(new_remark)}"
 
 
+# ----------------------------- ساخت لینک پین‌شده (همیشه ردیف اول) -----------------------------
+
+def build_pinned_config() -> str:
+    """لینک ثابت با تاریخ امروز (میلادی) توی ریمارک، بدون هیچ تست TCP‌ای."""
+    today = datetime.datetime.now(datetime.timezone.utc).strftime(PINNED_DATE_FORMAT)
+    remark = PINNED_REMARK_TEMPLATE.format(date=today)
+    base = PINNED_LINK_BASE.split("#", 1)[0]
+    return f"{base}#{urllib.parse.quote(remark)}"
+
+
 # ----------------------------- پردازش یک کانفیگ -----------------------------
 
-def process_config(link: str) -> tuple[str, bool, float] | None:
+def process_config(link: str) -> tuple[dict, float] | None:
+    """
+    پارس می‌کنه و (اگه SKIP_TCP_TEST نبود) تست TCP می‌گیره.
+    اگه SKIP_TCP_TEST=1 باشه، هیچ تستی نمی‌گیره و همه‌ی کانفیگ‌های پارس‌شده رو
+    (چه واقعاً روشن باشن چه نه) به‌عنوان «فعال» در نظر می‌گیره.
+    """
     parsed = parse_config(link)
     if not parsed:
         return None
+
+    if SKIP_TCP_TEST:
+        return parsed, 0.0
 
     ok, latency_ms = tcp_test(parsed["host"], parsed["port"])
     if not ok:
         return None
 
-    old_remark = parsed["remark"] or f"{parsed['protocol']}-{parsed['host']}"
-    new_remark = f"{REMARK_PREFIX} {old_remark} | {latency_ms:.0f}ms"
-    new_config = rebuild_config_with_new_remark(parsed, new_remark)
-    return new_config, True, latency_ms
+    return parsed, latency_ms
 
 
 # ----------------------------- main -----------------------------
@@ -236,8 +261,11 @@ def main():
         log.error("هیچ کانفیگی برای تست پیدا نشد.")
         sys.exit(1)
 
-    # ۲) تست TCP موازی
-    active: list[tuple[str, float]] = []
+    # ۲) تست TCP موازی (یا رد شدن ازش اگه SKIP_TCP_TEST=1 باشه)
+    if SKIP_TCP_TEST:
+        log.warning("SKIP_TCP_TEST فعاله — هیچ تست اتصالی گرفته نمی‌شه و همه‌ی کانفیگ‌ها بدون بررسی زنده‌بودن ذخیره می‌شن.")
+
+    active: list[tuple[dict, float]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_config, link): link for link in all_configs}
         done_count = 0
@@ -247,16 +275,18 @@ def main():
                 log.info(f"پیشرفت: {done_count}/{len(all_configs)}")
             result = future.result()
             if result:
-                new_config, _, latency_ms = result
-                active.append((new_config, latency_ms))
+                parsed, latency_ms = result
+                active.append((parsed, latency_ms))
 
-    # ۳) مرتب‌سازی بر اساس کمترین تاخیر
+    # ۳) مرتب‌سازی بر اساس کمترین تاخیر (وقتی SKIP_TCP_TEST=1 باشه همه لیتنسی‌شون صفره، پس ترتیب اصلی حفظ می‌شه)
     active.sort(key=lambda x: x[1])
 
-    # ۴) نوشتن خروجی
+    # ۴) ساخت ریمارک ثابت و نوشتن خروجی (سرور پین‌شده همیشه ردیف اوله)
     with open(args.output, "w", encoding="utf-8") as f:
-        for config, _ in active:
-            f.write(config + "\n")
+        f.write(build_pinned_config() + "\n")
+        for parsed, _ in active:
+            new_config = rebuild_config_with_new_remark(parsed, REMARK_TEXT)
+            f.write(new_config + "\n")
 
     log.info(f"تعداد کانفیگ‌های فعال: {len(active)} از {len(all_configs)}")
     log.info(f"خروجی نوشته شد در: {args.output}")
